@@ -1,80 +1,94 @@
 import json
+import logging
 import os
-import requests
+import azure.functions as func
 from openai import AzureOpenAI
 
-def main(req):
-    incident_sys_id = req.params.get("sys_id")
-    if not incident_sys_id:
-        return "sys_id missing"
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("processIncident function started")
 
-    token_url = f"{os.environ['SNOW_INSTANCE_URL']}/oauth_token.do"
+    try:
+        # 1. Read input JSON
+        try:
+            incident = req.get_json()
+        except Exception:
+            return func.HttpResponse(
+                "Invalid or missing JSON body",
+                status_code=400
+            )
 
-    token_resp = requests.post(
-        token_url,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "grant_type": "password",
-            "client_id": os.environ["SNOW_CLIENT_ID"],
-            "client_secret": os.environ["SNOW_CLIENT_SECRET"],
-            "username": os.environ["SNOW_USERNAME"],
-            "password": os.environ["SNOW_PASSWORD"]
-        }
-    ).json()
+        # 2. Load knowledge base
+        try:
+            with open("incident_kb.json", "r") as f:
+                kb = json.load(f)
+        except Exception as e:
+            logging.error(f"KB load failed: {str(e)}")
+            return func.HttpResponse(
+                "Knowledge base file not found",
+                status_code=500
+            )
 
-    access_token = token_resp.get("access_token")
-    if not access_token:
-        return token_resp
+        # 3. Create Azure OpenAI client
+        client = AzureOpenAI(
+            api_key=os.environ.get("AZURE_OPENAI_KEY"),
+            azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+            api_version="2024-02-15-preview"
+        )
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json"
-    }
+        # 4. Build prompt
+        prompt = f"""
+You are an IT incident triage expert.
 
-    incident = requests.get(
-        f"{os.environ['SNOW_INSTANCE_URL']}/api/now/table/incident/{incident_sys_id}",
-        headers=headers
-    ).json()["result"]
+Using ONLY the historical incident knowledge below,
+correct the fields of the new incident.
 
-    with open("incident_kb.json") as f:
-        kb = json.load(f)
+Historical Incident Knowledge:
+{json.dumps(kb, indent=2)}
 
-    client = AzureOpenAI(
-        api_key=os.environ["AZURE_OPENAI_KEY"],
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-        api_version="2024-02-15-preview"
-    )
+New Incident:
+{json.dumps(incident, indent=2)}
 
-    prompt = f'''
-Using only the knowledge base below, correct the incident.
+Return STRICT JSON with these fields only:
+- major_incident (true/false)
+- recommended_priority
+- recommended_category
+- recommended_assignment_group
+- confidence (0 to 1)
+- reasoning
+"""
 
-Knowledge Base:
-{json.dumps(kb)}
+        # 5. Call Azure OpenAI
+        response = client.chat.completions.create(
+            model="incident-poc",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0
+        )
 
-Incident:
-{json.dumps(incident)}
+        ai_output = response.choices[0].message.content
 
-Return JSON with:
-major_incident, recommended_priority, recommended_category,
-recommended_assignment_group, confidence, reasoning
-'''
+        # 6. Validate AI output is JSON
+        try:
+            parsed_output = json.loads(ai_output)
+        except Exception:
+            logging.error(f"AI returned non-JSON: {ai_output}")
+            return func.HttpResponse(
+                ai_output,
+                status_code=200,
+                mimetype="text/plain"
+            )
 
-    ai_resp = client.chat.completions.create(
-        model="incident-poc",
-        messages=[{"role": "user", "content": prompt}]
-    )
+        # 7. Return result
+        return func.HttpResponse(
+            json.dumps(parsed_output, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
 
-    result = json.loads(ai_resp.choices[0].message.content)
-
-    requests.patch(
-        f"{os.environ['SNOW_INSTANCE_URL']}/api/now/table/incident/{incident_sys_id}",
-        headers=headers,
-        json={
-            "priority": result["recommended_priority"],
-            "category": result["recommended_category"],
-            "assignment_group": result["recommended_assignment_group"],
-            "work_notes": result["reasoning"]
-        }
-    )
-
-    return result
+    except Exception as e:
+        logging.error(f"Unhandled error: {str(e)}")
+        return func.HttpResponse(
+            "Internal server error",
+            status_code=500
+        )
